@@ -1,0 +1,16 @@
+[project]
+name = "odor-gateway"
+version = "0.2.0"
+description = "고정형 악취 관측소 LoRa 게이트웨이 (규격 v0.2)"
+requires-python = ">=3.10"
+dependencies = ["pyserial>=3.5", "PyYAML>=6"]
+
+[project.scripts]
+odor-gateway = "odor_gateway.gateway:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["odor_gateway"]
