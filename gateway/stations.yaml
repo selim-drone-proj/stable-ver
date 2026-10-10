@@ -1,0 +1,23 @@
+# 고정형 관측소 설치 좌표 (WGS84). 설치 후 실측값으로 바꿀 것.
+# 게이트웨이가 이 값을 StationSample.latitude/longitude/altitude_msl 에 넣는다.
+stations:
+  fix_01:
+    name: "1호기"
+    latitude: 35.8242
+    longitude: 127.1480
+    altitude_msl: 40.0
+  fix_02:
+    name: "2호기"
+    latitude: 35.8251
+    longitude: 127.1492
+    altitude_msl: 41.0
+  fix_03:
+    name: "3호기"
+    latitude: 35.8236
+    longitude: 127.1501
+    altitude_msl: 39.5
+  fix_04:
+    name: "4호기"
+    latitude: 35.8229
+    longitude: 127.1474
+    altitude_msl: 40.5
