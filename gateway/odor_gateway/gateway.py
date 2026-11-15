@@ -6,6 +6,7 @@ E220 수신 모듈(CP2102 USB-TTL 로 PC 에 연결)이 받은 고정형 관측�
   2) 관측소별 CSV       <out>/station_<id>_YYYYmmdd.csv
      이동형 CSV         <out>/mobile_<mob_NN>_YYYYmmdd.csv (위치 + seq + RSSI. 링크 시험용)
   3) (선택) ROS 2 토픽  /station/<id>/sample, /odor/sample, /health/<id>, /health/gw_01
+  4) (선택) 관제 서버   odor_system /api/ingest 로 전송 (forward.py, 끊기면 spool 에 쌓았다가 다시)
 로 내보낸다.
 
     # 실제 수신
@@ -14,6 +15,8 @@ E220 수신 모듈(CP2102 USB-TTL 로 PC 에 연결)이 받은 고정형 관측�
     python -m odor_gateway.gateway --simulate --speed 60 --stations stations.yaml
     # ROS 2 로도 발행
     ... --ros
+    # 관제 서버로도 전송 (토큰은 환경변수 ODOR_INGEST_TOKEN). --forward-dry-run 이면 서버가 검증만 한다
+    ... --forward-url http://<서버>:8090/api/ingest
 """
 from __future__ import annotations
 
@@ -120,6 +123,14 @@ def run(args) -> int:
     parser = FrameParser(rssi_byte=args.rssi_byte)
     loss = LossTracker()
     bridge = None
+    fwd = None
+    if args.forward_url:
+        from .forward import Forwarder
+        token = os.environ.get("ODOR_INGEST_TOKEN", "")
+        if not token:
+            print("ODOR_INGEST_TOKEN 이 없어 서버가 거절합니다 (401). spool 에 쌓아 두고 계속 다시 보냅니다", file=sys.stderr)
+        fwd = Forwarder(args.forward_url, token, log.out, dry_run=args.forward_dry_run)
+        fwd.start()
     if args.ros:
         from .ros_bridge import RosBridge     # ROS 가 있을 때만 import
         bridge = RosBridge()
@@ -154,6 +165,8 @@ def run(args) -> int:
                 log.write(rec, stamp_unix, fr, received)
                 if bridge:
                     bridge.publish(rec)
+                if fwd:
+                    fwd.submit(rec)
                 count += 1
                 if not args.quiet:
                     print(summary(rec, fr) + (f"  (패킷 {gap}개 손실)" if gap else ""), flush=True)
@@ -162,7 +175,8 @@ def run(args) -> int:
                 h = record("device_health", received, GW_ID, state=2, firmware=GW_VERSION,
                            uptime_s=int(now - started), sensor_ok_mask=1, error_count=parser.crc_errors,
                            supply_v=None, cpu_temp_c=None, rssi_dbm=0,
-                           message=f"frames={count} lost={sum(loss.lost.values())} junk_bytes={parser.dropped_bytes}")
+                           message=f"frames={count} lost={sum(loss.lost.values())} junk_bytes={parser.dropped_bytes}"
+                                   + (f" {fwd.status()}" if fwd else ""))
                 log.write(h, received)
                 if bridge:
                     bridge.publish(h)
@@ -173,6 +187,8 @@ def run(args) -> int:
     except KeyboardInterrupt:
         return 0
     finally:
+        if fwd:
+            fwd.close()
         log.close()
         if bridge:
             bridge.close()
@@ -190,6 +206,9 @@ def main(argv=None) -> int:
     ap.add_argument("--speed", type=float, default=1.0, help="시뮬레이터 배속")
     ap.add_argument("--max-frames", type=int, default=0, help="이만큼 받으면 끝 (시험용)")
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--forward-url", help="관제 서버 적재 API (예: http://<서버>:8090/api/ingest). 토큰은 ODOR_INGEST_TOKEN")
+    ap.add_argument("--forward-dry-run", action="store_true",
+                    help="서버가 검증만 하고 저장하지 않게 (?dry_run=1). 이때는 가짜(SIMULATED) 데이터도 보낸다")
     return run(ap.parse_args(argv))
 
 

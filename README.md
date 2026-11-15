@@ -89,11 +89,36 @@ odor-gateway ... --ros                                                          
 odor-gateway ... --rssi-byte                                                       # E220 RSSI 덧붙이기를 켰을 때
 ```
 
-남기는 파일: `gateway_YYYYmmdd.jsonl` (모든 기록), `station_fix_0N_YYYYmmdd.csv` (관측소별).
+남기는 파일: `gateway_YYYYmmdd.jsonl` (모든 기록), `station_fix_0N_YYYYmmdd.csv` (관측소별),
+`mobile_mob_01_YYYYmmdd.csv` (드론 패킷의 위치, seq, RSSI).
 ROS 2: `/station/fix_0N/sample`, `/health/fix_0N`, `/health/gw_01`. `--ros` 는 ROS 2 Jazzy 와 odor_msgs
 (moving-ver/ros2_ws) 가 빌드되어 있어야 합니다.
 
 `stations.yaml` 의 좌표는 임시값입니다. 설치 후 실측 좌표로 바꿉니다.
+
+### 4-1. 관제 서버로 전송 (odor_system `/api/ingest`)
+
+게이트웨이 PC 가 인터넷에 연결되어 있으면, 받은 기록을 관제 서버의 적재 API 로 보낼 수 있습니다.
+
+```bash
+export ODOR_INGEST_TOKEN=<서버 장비 토큰>
+odor-gateway --port /dev/ttyUSB0 --stations stations.yaml --forward-url http://<서버>:8090/api/ingest --forward-dry-run  # 서버는 검증만
+odor-gateway --port /dev/ttyUSB0 --stations stations.yaml --forward-url http://<서버>:8090/api/ingest                    # 실제 적재
+```
+
+| 게이트웨이 기록 | 서버 레코드 | 변환 |
+|---|---|---|
+| `odor_sample` (드론) | `odor` `DX-01` | NH3, H2S ppm x 1000 -> ppb, `so2_ppb` null, 위치 lat/lon, `alt_m` = 이륙점 기준 고도 |
+| | `battery` `DRN-01` | `voltage_v` 만 (나머지 null) |
+| `station_sample` | `odor` `FX-01` ~ `FX-04` | NH3, H2S ppb, `stations.yaml` 설치 좌표 |
+| `device_health` | 보내지 않음 | |
+
+- TVOC, eCO2, BME688, PM, flags 는 서버에 받을 칸이 없어 보내지 않습니다. 원본은 `gateway_*.jsonl` 에 남습니다.
+- 예열, 영점 보정, 퍼지, 가짜(SIMULATED) 데이터는 보내지 않습니다. `--forward-dry-run` 일 때만 형식 확인용으로 모두 보냅니다.
+- 보낼 레코드는 `<out>/forward_spool.jsonl` 에 먼저 쌓고, 서버가 받으면 지웁니다. 네트워크가 끊기거나 토큰이 틀리면 남겨 두고
+  5 초 ~ 60 초 간격으로 다시 보냅니다 (게이트웨이를 다시 켜도 이어서 보냄). 서버가 같은 (장비, 시각)을 중복으로 건너뛰므로 다시 보내도 안전합니다.
+- 서버가 거절한 레코드(미등록 장비 등)는 이유와 함께 `<out>/forward_rejected.jsonl` 로 옮깁니다. 현재 서버에 `FX-04` 가 등록되어 있지 않습니다.
+- 전송 현황은 게이트웨이 상태 기록(`gw_01` 의 message: `fwd_accepted`, `fwd_pending`, `fwd_err` 등)에 10 초마다 남습니다.
 
 ## 5. 시험
 
