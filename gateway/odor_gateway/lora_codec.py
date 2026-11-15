@@ -2,6 +2,7 @@
 lora_codec.py - 고정형 관측소 LoRa 패킷 v1 디코더/인코더 (표준 라이브러리만 사용)
 
 C++ 짝: stable-ver/firmware/fix_station/lora_packet.h  (둘을 같이 고칠 것)
+이동형(type 0x03) 짝: moving-ver/ros2_ws/src/odor_drone/odor_drone/lora_mobile.py
 규격:  stable-ver/protocol/LORA_PACKET.md
 
     parser = FrameParser(rssi_byte=False)
@@ -18,17 +19,24 @@ SYNC = b"\xA5\x5A"
 VERSION = 1
 TYPE_SAMPLE = 0x01
 TYPE_HEALTH = 0x02
+TYPE_MOBILE = 0x03                         # 이동형 요약 (드론 위치 + 가스)
 
 HEADER = struct.Struct("<BBBHIB")          # version, type, station, seq, time, len  (동기 바이트 뒤 10바이트)
 SAMPLE = struct.Struct("<6Hh5H2iH2BH")     # 38 바이트
 HEALTH = struct.Struct("<I3BBHHHH")        # 16 바이트
+MOBILE = struct.Struct("<iihhHH4Hh4H3BH")  # 39 바이트
 HEADER_LEN = 2 + HEADER.size               # 12
 CRC_LEN = 2
-PAYLOAD_LEN = {TYPE_SAMPLE: SAMPLE.size, TYPE_HEALTH: HEALTH.size}
+PAYLOAD_LEN = {TYPE_SAMPLE: SAMPLE.size, TYPE_HEALTH: HEALTH.size, TYPE_MOBILE: MOBILE.size}
 
 U16_NA = 0xFFFF
 I16_NA = -32768
 I32_NA = -(2**31)
+U8_NA = 0xFF
+
+STATUS_ARMED = 1 << 0                      # MOBILE status 바이트
+STATUS_IN_AIR = 1 << 1
+STATUS_FIX_SHIFT = 2                       # bit2~4: gps_fix_type 0~7
 
 # 품질 비트 (GasReading.flags 와 같음)
 FLAGS = {
@@ -45,6 +53,19 @@ _SAMPLE_SCALED = [
 _SAMPLE_SCALED_TAIL = [
     ("humidity_pct", 0.01), ("pressure_hpa", 0.1), ("pm1_0_ugm3", 1.0), ("pm2_5_ugm3", 1.0), ("pm10_ugm3", 1.0),
 ]
+
+# MOBILE: (필드, 형식, LSB). 구조 순서와 같다. moving-ver lora_mobile.FIELDS 와 같아야 한다
+_MOBILE = [
+    ("latitude", "i32", 1e-7), ("longitude", "i32", 1e-7),
+    ("altitude_msl", "i16", 0.1), ("altitude_rel", "i16", 0.1),
+    ("heading_deg", "u16", 0.01), ("ground_speed_mps", "u16", 0.01),
+    ("nh3_ppm", "u16", 0.01), ("h2s_ppm", "u16", 0.001), ("tvoc_ppb", "u16", 1.0), ("eco2_ppm", "u16", 1.0),
+    ("temperature_c", "i16", 0.01), ("humidity_pct", "u16", 0.01), ("pressure_hpa", "u16", 0.1),
+    ("gas_resistance_ohm", "u16", 100.0), ("flags", "raw16", 1),
+    ("status", "raw8", 1), ("gps_satellites", "raw8", 1), ("drone_age_s", "u8", 0.1),
+    ("battery_voltage", "u16", 0.01),
+]
+_NA = {"u8": U8_NA, "u16": U16_NA, "i16": I16_NA, "i32": I32_NA}
 
 
 def crc16_ccitt(data: bytes) -> int:
@@ -86,7 +107,8 @@ class Frame:
 
     @property
     def station_id(self) -> str:
-        return f"fix_{self.station:02d}"
+        """고정형은 fix_NN, 이동형(type 0x03)은 센서 묶음 ID mob_NN"""
+        return f"{'mob' if self.type == TYPE_MOBILE else 'fix'}_{self.station:02d}"
 
 
 def decode_payload(ftype: int, payload: bytes) -> dict:
@@ -117,7 +139,29 @@ def decode_payload(ftype: int, payload: bytes) -> dict:
             "supply_v": None if v[7] == U16_NA else v[7] / 1000.0,
             "free_ram": v[8],
         }
+    if ftype == TYPE_MOBILE:
+        out = {}
+        for raw, (name, kind, lsb) in zip(MOBILE.unpack(payload), _MOBILE):
+            if kind.startswith("raw"):
+                out[name] = raw
+            else:
+                out[name] = None if raw == _NA[kind] else round(raw * lsb, 7)
+        st = out.pop("status")
+        out["armed"] = bool(st & STATUS_ARMED)
+        out["in_air"] = bool(st & STATUS_IN_AIR)
+        out["gps_fix_type"] = (st >> STATUS_FIX_SHIFT) & 0x07
+        return out
     raise ValueError(f"모르는 패킷 종류 0x{ftype:02X}")
+
+
+def _enc(v, kind: str, lsb: float) -> int:
+    if kind.startswith("raw"):
+        return int(v)
+    if v is None or (isinstance(v, float) and not math.isfinite(v)):
+        return _NA[kind]
+    lo, hi = {"u8": (0, 254), "u16": (0, 65534), "i16": (-32767, 32767), "i32": (-(2**31 - 1), 2**31 - 1)}[kind]
+    x = max(lo, min(hi, v / lsb))
+    return int(math.floor(x + 0.5)) if x >= 0 else int(math.ceil(x - 0.5))
 
 
 def encode_frame(ftype: int, station: int, seq: int, epoch_s: int, fields: dict) -> bytes:
@@ -140,6 +184,14 @@ def encode_frame(ftype: int, station: int, seq: int, epoch_s: int, fields: dict)
             f.get("uptime_s", 0), major, minor, patch, f.get("state", 2), f.get("sensor_ok_mask", 0),
             f.get("error_count", 0), U16_NA if vin is None else int(round(vin * 1000)), f.get("free_ram", 0),
         )
+    elif ftype == TYPE_MOBILE:
+        f = dict(fields)
+        fix = max(0, min(7, int(f.get("gps_fix_type") or 0)))
+        f["status"] = ((STATUS_ARMED if f.get("armed") else 0) | (STATUS_IN_AIR if f.get("in_air") else 0)
+                       | (fix << STATUS_FIX_SHIFT))
+        f.setdefault("flags", 0)
+        f["gps_satellites"] = max(0, min(255, int(f.get("gps_satellites") or 0)))
+        payload = MOBILE.pack(*(_enc(f.get(n), k, lsb) for n, k, lsb in _MOBILE))
     else:
         raise ValueError(ftype)
     body = HEADER.pack(VERSION, ftype, station, seq & 0xFFFF, epoch_s & 0xFFFFFFFF, len(payload)) + payload

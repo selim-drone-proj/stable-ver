@@ -1,10 +1,12 @@
 """
 gateway.py - 지상국 LoRa 게이트웨이 (gw_01)
 
-E220 수신 모듈(CP2102 USB-TTL 로 PC 에 연결)이 받은 고정형 관측소 패킷을 풀어서
+E220 수신 모듈(CP2102 USB-TTL 로 PC 에 연결)이 받은 고정형 관측소, 이동형(드론) 패킷을 풀어서
   1) JSON Lines 로그   <out>/gateway_YYYYmmdd.jsonl      (모든 기록, 규격 v0.2)
   2) 관측소별 CSV       <out>/station_<id>_YYYYmmdd.csv
-  3) (선택) ROS 2 토픽  /station/<id>/sample, /health/<id>, /health/gw_01
+     이동형 CSV         <out>/mobile_<mob_NN>_YYYYmmdd.csv (위치 + seq + RSSI. 링크 시험용)
+  3) (선택) ROS 2 토픽  /station/<id>/sample, /odor/sample, /health/<id>, /health/gw_01
+  4) (선택) 관제 서버   odor_system /api/ingest 로 전송 (forward.py, 끊기면 spool 에 쌓았다가 다시)
 로 내보낸다.
 
     # 실제 수신
@@ -13,6 +15,8 @@ E220 수신 모듈(CP2102 USB-TTL 로 PC 에 연결)이 받은 고정형 관측�
     python -m odor_gateway.gateway --simulate --speed 60 --stations stations.yaml
     # ROS 2 로도 발행
     ... --ros
+    # 관제 서버로도 전송 (토큰은 환경변수 ODOR_INGEST_TOKEN). --forward-dry-run 이면 서버가 검증만 한다
+    ... --forward-url http://<서버>:8090/api/ingest
 """
 from __future__ import annotations
 
@@ -26,7 +30,8 @@ from pathlib import Path
 
 from .lora_codec import FrameParser
 from .odor_json import record
-from .records import STATION_CSV_COLUMNS, frame_to_record, load_stations, station_csv_row
+from .records import (MOBILE_CSV_COLUMNS, STATION_CSV_COLUMNS, frame_to_record, load_stations, mobile_csv_row,
+                      station_csv_row)
 
 GW_ID = "gw_01"
 GW_VERSION = "lora_gateway 0.2.0"
@@ -51,7 +56,7 @@ class Logger:
             self._files[name] = f
         return f
 
-    def write(self, rec: dict, stamp_unix: float):
+    def write(self, rec: dict, stamp_unix: float, frame=None, received: float | None = None):
         day = time.strftime("%Y%m%d", time.gmtime(stamp_unix))
         f = self._open(f"gateway_{day}.jsonl", None)
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -59,6 +64,12 @@ class Logger:
         if rec["type"] == "station_sample":
             f = self._open(f"station_{rec['device_id']}_{day}.csv", STATION_CSV_COLUMNS)
             csv.writer(f, lineterminator="\n").writerow(station_csv_row(rec, stamp_unix))
+            f.flush()
+        elif rec["type"] == "odor_sample" and frame is not None:
+            f = self._open(f"mobile_{rec['gas']['device_id']}_{day}.csv", MOBILE_CSV_COLUMNS)
+            row = mobile_csv_row(rec, stamp_unix, frame.seq, frame.rssi_dbm,
+                                 stamp_unix if received is None else received)
+            csv.writer(f, lineterminator="\n").writerow(row)
             f.flush()
 
     def close(self):
@@ -85,13 +96,20 @@ class LossTracker:
         return gap
 
 
-def summary(rec: dict) -> str:
+def summary(rec: dict, frame=None) -> str:
+    def v(x, nd):
+        return "-" if x is None else f"{x:.{nd}f}"
+
+    if rec["type"] == "odor_sample":
+        d, g = rec["drone"], rec["gas"]
+        seq = f" seq={frame.seq:5d}" if frame else ""
+        rssi = f" rssi={frame.rssi_dbm}" if frame and frame.rssi_dbm is not None else ""
+        return (f"{rec['stamp']} {g['device_id']}{seq} lat={v(d['latitude'], 6)} lon={v(d['longitude'], 6)} "
+                f"alt={v(d['altitude_rel'], 1)} NH3={v(g['nh3_ppm'], 2)} H2S={v(g['h2s_ppm'], 3)} "
+                f"TVOC={v(g['tvoc_ppb'], 0)} T={v(g['temperature_c'], 1)} RH={v(g['humidity_pct'], 0)} "
+                f"flags=0x{g['flags']:04X}{rssi}")
     if rec["type"] == "station_sample":
         g = rec["gas"]
-
-        def v(x, nd):
-            return "-" if x is None else f"{x:.{nd}f}"
-
         return (f"{rec['stamp']} {rec['device_id']} seq={rec['seq']:5d} "
                 f"NH3={v(g['nh3_ppm'], 2)} H2S={v(g['h2s_ppm'], 3)} VOC={v(g['voc_index'], 0)} "
                 f"T={v(g['temperature_c'], 1)} RH={v(g['humidity_pct'], 0)} PM2.5={v(g['pm2_5_ugm3'], 0)} "
@@ -105,6 +123,14 @@ def run(args) -> int:
     parser = FrameParser(rssi_byte=args.rssi_byte)
     loss = LossTracker()
     bridge = None
+    fwd = None
+    if args.forward_url:
+        from .forward import Forwarder
+        token = os.environ.get("ODOR_INGEST_TOKEN", "")
+        if not token:
+            print("ODOR_INGEST_TOKEN 이 없어 서버가 거절합니다 (401). spool 에 쌓아 두고 계속 다시 보냅니다", file=sys.stderr)
+        fwd = Forwarder(args.forward_url, token, log.out, dry_run=args.forward_dry_run)
+        fwd.start()
     if args.ros:
         from .ros_bridge import RosBridge     # ROS 가 있을 때만 import
         bridge = RosBridge()
@@ -136,18 +162,21 @@ def run(args) -> int:
                 rec = frame_to_record(fr, received, stations)
                 stamp_unix = fr.time or received
                 gap = loss.update(fr.station_id, fr.seq)
-                log.write(rec, stamp_unix)
+                log.write(rec, stamp_unix, fr, received)
                 if bridge:
                     bridge.publish(rec)
+                if fwd:
+                    fwd.submit(rec)
                 count += 1
                 if not args.quiet:
-                    print(summary(rec) + (f"  (패킷 {gap}개 손실)" if gap else ""), flush=True)
+                    print(summary(rec, fr) + (f"  (패킷 {gap}개 손실)" if gap else ""), flush=True)
             if now - last_gw_health >= 10:
                 last_gw_health = now
                 h = record("device_health", received, GW_ID, state=2, firmware=GW_VERSION,
                            uptime_s=int(now - started), sensor_ok_mask=1, error_count=parser.crc_errors,
                            supply_v=None, cpu_temp_c=None, rssi_dbm=0,
-                           message=f"frames={count} lost={sum(loss.lost.values())} junk_bytes={parser.dropped_bytes}")
+                           message=f"frames={count} lost={sum(loss.lost.values())} junk_bytes={parser.dropped_bytes}"
+                                   + (f" {fwd.status()}" if fwd else ""))
                 log.write(h, received)
                 if bridge:
                     bridge.publish(h)
@@ -158,6 +187,8 @@ def run(args) -> int:
     except KeyboardInterrupt:
         return 0
     finally:
+        if fwd:
+            fwd.close()
         log.close()
         if bridge:
             bridge.close()
@@ -175,6 +206,9 @@ def main(argv=None) -> int:
     ap.add_argument("--speed", type=float, default=1.0, help="시뮬레이터 배속")
     ap.add_argument("--max-frames", type=int, default=0, help="이만큼 받으면 끝 (시험용)")
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--forward-url", help="관제 서버 적재 API (예: http://<서버>:8090/api/ingest). 토큰은 ODOR_INGEST_TOKEN")
+    ap.add_argument("--forward-dry-run", action="store_true",
+                    help="서버가 검증만 하고 저장하지 않게 (?dry_run=1). 이때는 가짜(SIMULATED) 데이터도 보낸다")
     return run(ap.parse_args(argv))
 
 
